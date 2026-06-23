@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "v7-appshape"
+VERSION = "v8-sorted"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("cinema-api")
@@ -308,13 +308,18 @@ def now_playing_sa(lang: str = "en-US") -> list:
     out = []
     try:
         _load_genres(lang)
-        r = requests.get(
-            f"{TMDB}/movie/now_playing",
-            params={"api_key": TMDB_KEY, "language": lang,
-                    "region": TMDB_REGION, "page": 1},
-            timeout=10,
-        ).json()
-        for item in r.get("results", []):
+        results = []
+        for page in (1, 2):
+            r = requests.get(
+                f"{TMDB}/movie/now_playing",
+                params={"api_key": TMDB_KEY, "language": lang,
+                        "region": TMDB_REGION, "page": page},
+                timeout=10,
+            ).json()
+            results.extend(r.get("results", []))
+        # newest release first; missing dates sink to the bottom
+        results.sort(key=lambda it: it.get("release_date") or "", reverse=True)
+        for item in results:
             out.append(_build_movie(item, lang))
     except Exception:
         log.exception("now_playing fetch failed")
