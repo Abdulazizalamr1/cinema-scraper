@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "v8-sorted"
+VERSION = "v9-window"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("cinema-api")
@@ -329,22 +329,38 @@ def now_playing_sa(lang: str = "en-US") -> list:
 
 
 def upcoming_sa(lang: str = "en-US") -> list:
-    """Films coming soon in Saudi Arabia, shaped for the calendar tab."""
+    """Films releasing in Saudi Arabia over the next ~8 weeks, for the calendar."""
     hit = _UPCOMING_CACHE.get(lang)
     if hit and time.time() - hit[0] < _UPCOMING_TTL:
         return hit[1]
 
+    today = dt.date.today()
+    window_end = today + dt.timedelta(days=60)   # rolling ~8-week window
+    seen = set()
     out = []
     try:
         _load_genres(lang)
-        r = requests.get(
-            f"{TMDB}/movie/upcoming",
-            params={"api_key": TMDB_KEY, "language": lang,
-                    "region": TMDB_REGION, "page": 1},
-            timeout=10,
-        ).json()
-        for item in r.get("results", []):
-            out.append(_build_upcoming(item, lang))
+        for page in (1, 2, 3):
+            r = requests.get(
+                f"{TMDB}/discover/movie",
+                params={
+                    "api_key": TMDB_KEY, "language": lang, "region": TMDB_REGION,
+                    "with_release_type": "2|3",          # theatrical
+                    "release_date.gte": today.isoformat(),
+                    "release_date.lte": window_end.isoformat(),
+                    "sort_by": "primary_release_date.asc",
+                    "page": page,
+                },
+                timeout=10,
+            ).json()
+            results = r.get("results", [])
+            if not results:
+                break
+            for item in results:
+                if item["id"] in seen:
+                    continue
+                seen.add(item["id"])
+                out.append(_build_upcoming(item, lang))
         # soonest-first, then drop the internal sort key
         out.sort(key=lambda m: m.get("_releaseIso") or "9999-99-99")
         for m in out:
