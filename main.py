@@ -14,6 +14,7 @@ Endpoints:
 Run locally:  uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
+import os
 import re
 import time
 import logging
@@ -27,10 +28,106 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "v3-single"
+VERSION = "v4-enriched"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("cinema-api")
+
+# ===========================================================================
+#  Movie metadata enrichment  (posters / ratings / trailers)
+#  Pulls from TMDB (posters + trailers) and OMDb (IMDb / RT / Metacritic),
+#  then attaches them to each movie before the feed reaches the app.
+#
+#  Set these on Render -> Environment:
+#      TMDB_API_KEY = 75f498ad0b4eb27bb3e4e712d1b1d235
+#      OMDB_API_KEY = 92c18a24
+# ===========================================================================
+
+TMDB_KEY = os.environ.get("TMDB_API_KEY", "")
+OMDB_KEY = os.environ.get("OMDB_API_KEY", "")
+
+TMDB = "https://api.themoviedb.org/3"
+IMG = "https://image.tmdb.org/t/p"
+OMDB = "https://www.omdbapi.com/"
+
+# In-memory cache (24h) so a feed refresh doesn't blow through
+# OMDb's free 1000-requests/day limit when the same movies repeat.
+_META_CACHE: dict = {}
+_META_TTL = 24 * 60 * 60
+
+
+def _meta_for_title(title: str, lang: str = "en-US") -> dict:
+    key = (title.lower().strip(), lang)
+    hit = _META_CACHE.get(key)
+    if hit and time.time() - hit[0] < _META_TTL:
+        return hit[1]
+
+    meta = {
+        "posterUrl": None,
+        "trailerUrl": None,
+        "ratings": {"imdb": None, "rotten_tomatoes": None, "metacritic": None},
+    }
+    try:
+        r = requests.get(
+            f"{TMDB}/search/movie",
+            params={"api_key": TMDB_KEY, "query": title, "language": lang},
+            timeout=10,
+        )
+        hits = r.json().get("results", [])
+        if hits:
+            mid = hits[0]["id"]
+            d = requests.get(
+                f"{TMDB}/movie/{mid}",
+                params={
+                    "api_key": TMDB_KEY,
+                    "language": lang,
+                    "append_to_response": "videos,external_ids",
+                },
+                timeout=10,
+            ).json()
+
+            if d.get("poster_path"):
+                meta["posterUrl"] = f"{IMG}/w500{d['poster_path']}"
+
+            for v in d.get("videos", {}).get("results", []):
+                if v.get("site") == "YouTube" and v.get("type") == "Trailer":
+                    meta["trailerUrl"] = f"https://www.youtube.com/watch?v={v['key']}"
+                    break
+
+            imdb_id = d.get("external_ids", {}).get("imdb_id")
+            if imdb_id and OMDB_KEY:
+                o = requests.get(
+                    OMDB,
+                    params={"i": imdb_id, "apikey": OMDB_KEY, "tomatoes": "true"},
+                    timeout=10,
+                ).json()
+                by = {x["Source"]: x["Value"] for x in o.get("Ratings", [])}
+                meta["ratings"] = {
+                    "imdb": by.get("Internet Movie Database"),
+                    "rotten_tomatoes": by.get("Rotten Tomatoes"),
+                    "metacritic": by.get("Metacritic"),
+                }
+    except Exception:
+        # Never let a metadata hiccup break the whole feed.
+        pass
+
+    _META_CACHE[key] = (time.time(), meta)
+    return meta
+
+
+def enrich_movies(movies: list, lang: str = "en-US") -> list:
+    """Fill posterUrl / trailerUrl / ratings on each movie dict in-place."""
+    for m in movies:
+        title = m.get("title")
+        if not title:
+            continue
+        meta = _meta_for_title(title, lang)
+        if meta["posterUrl"] and not m.get("posterUrl"):
+            m["posterUrl"] = meta["posterUrl"]
+        m["trailerUrl"] = meta["trailerUrl"]
+        m["ratings"] = meta["ratings"]
+    return movies
+
 
 # ===========================================================================
 #  Helpers
@@ -308,7 +405,11 @@ def _collect(date: Optional[dt.date]) -> dict:
             log.info("%s: %d movies, %d theaters, %d showtimes", name, len(m), len(t), len(s))
         except Exception as e:
             log.exception("scraper %s failed: %s", name, e)
-    return {"movies": list(movies.values()),
+
+    movie_list = list(movies.values())
+    # Attach posters / ratings / trailers from TMDB + OMDb.
+    enrich_movies(movie_list)
+    return {"movies": movie_list,
             "theaters": list(theaters.values()),
             "showtimes": showtimes}
 
