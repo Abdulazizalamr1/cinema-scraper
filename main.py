@@ -1,15 +1,17 @@
 """
 KSA Cinema Showtimes API  —  SINGLE-FILE version.
 
-Everything (helpers + VOX scraper + web server) is in this one file on purpose,
-so there are no folders to get wrong when uploading. Just this file plus
-requirements.txt and you're done.
+Everything (helpers + VOX scraper + metadata + web server) is in this one file
+on purpose, so there are no folders to get wrong when uploading. Just this file
+plus requirements.txt and you're done.
 
 Endpoints:
-    /            -> status + version (quick check the right build is live)
-    /api/data    -> the JSON your Android app reads
-    /api/debug   -> diagnostics: shows what VOX actually returns
-    /health      -> {"status":"ok"}
+    /             -> status + version
+    /api/catalog  -> "Now Playing in Saudi Arabia" with posters/ratings/trailers
+                     (no showtimes needed — point your app here for now)
+    /api/data     -> the scraper feed (movies + theaters + showtimes)
+    /api/debug    -> diagnostics: shows what VOX actually returns
+    /health       -> {"status":"ok"}
 
 Run locally:  uvicorn main:app --host 0.0.0.0 --port 8000
 """
@@ -28,15 +30,14 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "v4-enriched"
+VERSION = "v6-upcoming"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("cinema-api")
 
 # ===========================================================================
-#  Movie metadata enrichment  (posters / ratings / trailers)
-#  Pulls from TMDB (posters + trailers) and OMDb (IMDb / RT / Metacritic),
-#  then attaches them to each movie before the feed reaches the app.
+#  Movie metadata  (posters / ratings / trailers)
+#  TMDB = posters + trailers + "now playing".   OMDb = IMDb / RT / Metacritic.
 #
 #  Set these on Render -> Environment:
 #      TMDB_API_KEY = 75f498ad0b4eb27bb3e4e712d1b1d235
@@ -49,22 +50,101 @@ OMDB_KEY = os.environ.get("OMDB_API_KEY", "")
 TMDB = "https://api.themoviedb.org/3"
 IMG = "https://image.tmdb.org/t/p"
 OMDB = "https://www.omdbapi.com/"
+TMDB_REGION = "SA"          # Saudi Arabia theatrical releases
 
-# In-memory cache (24h) so a feed refresh doesn't blow through
-# OMDb's free 1000-requests/day limit when the same movies repeat.
 _META_CACHE: dict = {}
-_META_TTL = 24 * 60 * 60
+_META_TTL = 24 * 60 * 60     # 24h, protects OMDb's 1000/day free limit
+_CATALOG_CACHE: dict = {}
+_CATALOG_TTL = 6 * 60 * 60   # refresh "now playing" a few times a day
+_UPCOMING_CACHE: dict = {}
+_UPCOMING_TTL = 12 * 60 * 60  # upcoming changes slowly; refresh twice a day
+_GENRE_CACHE: dict = {}
 
 
-def _meta_for_title(title: str, lang: str = "en-US") -> dict:
-    key = (title.lower().strip(), lang)
+def _load_genres(lang: str = "en-US") -> dict:
+    if _GENRE_CACHE:
+        return _GENRE_CACHE
+    try:
+        r = requests.get(
+            f"{TMDB}/genre/movie/list",
+            params={"api_key": TMDB_KEY, "language": lang},
+            timeout=10,
+        ).json()
+        for g in r.get("genres", []):
+            _GENRE_CACHE[g["id"]] = g["name"]
+    except Exception:
+        pass
+    return _GENRE_CACHE
+
+
+def _omdb_ratings(imdb_id: str) -> dict:
+    out = {"imdb": None, "rotten_tomatoes": None, "metacritic": None}
+    if not (imdb_id and OMDB_KEY):
+        return out
+    try:
+        o = requests.get(
+            OMDB,
+            params={"i": imdb_id, "apikey": OMDB_KEY, "tomatoes": "true"},
+            timeout=10,
+        ).json()
+        by = {x["Source"]: x["Value"] for x in o.get("Ratings", [])}
+        out = {
+            "imdb": by.get("Internet Movie Database"),
+            "rotten_tomatoes": by.get("Rotten Tomatoes"),
+            "metacritic": by.get("Metacritic"),
+        }
+    except Exception:
+        pass
+    return out
+
+
+def _meta_for_tmdb_id(mid: int, lang: str = "en-US") -> dict:
+    """Full metadata for a movie we already know the TMDB id of."""
+    key = ("id", mid, lang)
     hit = _META_CACHE.get(key)
     if hit and time.time() - hit[0] < _META_TTL:
         return hit[1]
 
     meta = {
-        "posterUrl": None,
-        "trailerUrl": None,
+        "posterUrl": None, "trailerUrl": None, "durationMin": None, "genre": None,
+        "ratings": {"imdb": None, "rotten_tomatoes": None, "metacritic": None},
+    }
+    try:
+        d = requests.get(
+            f"{TMDB}/movie/{mid}",
+            params={"api_key": TMDB_KEY, "language": lang,
+                    "append_to_response": "videos,external_ids"},
+            timeout=10,
+        ).json()
+
+        if d.get("poster_path"):
+            meta["posterUrl"] = f"{IMG}/w500{d['poster_path']}"
+        if d.get("runtime"):
+            meta["durationMin"] = d["runtime"]
+        if d.get("genres"):
+            meta["genre"] = d["genres"][0]["name"]
+
+        for v in d.get("videos", {}).get("results", []):
+            if v.get("site") == "YouTube" and v.get("type") == "Trailer":
+                meta["trailerUrl"] = f"https://www.youtube.com/watch?v={v['key']}"
+                break
+
+        meta["ratings"] = _omdb_ratings(d.get("external_ids", {}).get("imdb_id"))
+    except Exception:
+        pass
+
+    _META_CACHE[key] = (time.time(), meta)
+    return meta
+
+
+def _meta_for_title(title: str, lang: str = "en-US") -> dict:
+    """Metadata when we only have a title (used by the scraper feed)."""
+    key = ("title", title.lower().strip(), lang)
+    hit = _META_CACHE.get(key)
+    if hit and time.time() - hit[0] < _META_TTL:
+        return hit[1]
+    meta = {
+        "posterUrl": None, "trailerUrl": None, "durationMin": None, "genre": None,
         "ratings": {"imdb": None, "rotten_tomatoes": None, "metacritic": None},
     }
     try:
@@ -72,51 +152,18 @@ def _meta_for_title(title: str, lang: str = "en-US") -> dict:
             f"{TMDB}/search/movie",
             params={"api_key": TMDB_KEY, "query": title, "language": lang},
             timeout=10,
-        )
-        hits = r.json().get("results", [])
+        ).json()
+        hits = r.get("results", [])
         if hits:
-            mid = hits[0]["id"]
-            d = requests.get(
-                f"{TMDB}/movie/{mid}",
-                params={
-                    "api_key": TMDB_KEY,
-                    "language": lang,
-                    "append_to_response": "videos,external_ids",
-                },
-                timeout=10,
-            ).json()
-
-            if d.get("poster_path"):
-                meta["posterUrl"] = f"{IMG}/w500{d['poster_path']}"
-
-            for v in d.get("videos", {}).get("results", []):
-                if v.get("site") == "YouTube" and v.get("type") == "Trailer":
-                    meta["trailerUrl"] = f"https://www.youtube.com/watch?v={v['key']}"
-                    break
-
-            imdb_id = d.get("external_ids", {}).get("imdb_id")
-            if imdb_id and OMDB_KEY:
-                o = requests.get(
-                    OMDB,
-                    params={"i": imdb_id, "apikey": OMDB_KEY, "tomatoes": "true"},
-                    timeout=10,
-                ).json()
-                by = {x["Source"]: x["Value"] for x in o.get("Ratings", [])}
-                meta["ratings"] = {
-                    "imdb": by.get("Internet Movie Database"),
-                    "rotten_tomatoes": by.get("Rotten Tomatoes"),
-                    "metacritic": by.get("Metacritic"),
-                }
+            meta = _meta_for_tmdb_id(hits[0]["id"], lang)
     except Exception:
-        # Never let a metadata hiccup break the whole feed.
         pass
-
     _META_CACHE[key] = (time.time(), meta)
     return meta
 
 
 def enrich_movies(movies: list, lang: str = "en-US") -> list:
-    """Fill posterUrl / trailerUrl / ratings on each movie dict in-place."""
+    """Fill posterUrl / trailerUrl / ratings on scraper movies (by title)."""
     for m in movies:
         title = m.get("title")
         if not title:
@@ -127,6 +174,81 @@ def enrich_movies(movies: list, lang: str = "en-US") -> list:
         m["trailerUrl"] = meta["trailerUrl"]
         m["ratings"] = meta["ratings"]
     return movies
+
+
+def _build_item(item: dict, lang: str, with_release: bool = False) -> dict:
+    """Turn one TMDB list entry into the app's enriched movie shape."""
+    mid = item["id"]
+    meta = _meta_for_tmdb_id(mid, lang)
+    poster = meta["posterUrl"]
+    if not poster and item.get("poster_path"):
+        poster = f"{IMG}/w500{item['poster_path']}"
+    genre = meta["genre"]
+    if not genre and item.get("genre_ids"):
+        genre = _GENRE_CACHE.get(item["genre_ids"][0])
+    out = {
+        "id": f"TMDB-{mid}",
+        "title": item.get("title"),
+        "posterUrl": poster,
+        "genre": genre,
+        "durationMin": meta["durationMin"],
+        "trailerUrl": meta["trailerUrl"],
+        "ratings": meta["ratings"],
+    }
+    if with_release:
+        # release_date from the list entry; fall back to detail field if needed
+        out["releaseDate"] = item.get("release_date") or None
+    return out
+
+
+def now_playing_sa(lang: str = "en-US") -> list:
+    """Films currently in theaters in Saudi Arabia, fully enriched."""
+    hit = _CATALOG_CACHE.get(lang)
+    if hit and time.time() - hit[0] < _CATALOG_TTL:
+        return hit[1]
+
+    out = []
+    try:
+        _load_genres(lang)
+        r = requests.get(
+            f"{TMDB}/movie/now_playing",
+            params={"api_key": TMDB_KEY, "language": lang,
+                    "region": TMDB_REGION, "page": 1},
+            timeout=10,
+        ).json()
+        for item in r.get("results", []):
+            out.append(_build_item(item, lang))
+    except Exception:
+        log.exception("now_playing fetch failed")
+
+    _CATALOG_CACHE[lang] = (time.time(), out)
+    return out
+
+
+def upcoming_sa(lang: str = "en-US") -> list:
+    """Films coming soon in Saudi Arabia, enriched + with releaseDate."""
+    hit = _UPCOMING_CACHE.get(lang)
+    if hit and time.time() - hit[0] < _UPCOMING_TTL:
+        return hit[1]
+
+    out = []
+    try:
+        _load_genres(lang)
+        r = requests.get(
+            f"{TMDB}/movie/upcoming",
+            params={"api_key": TMDB_KEY, "language": lang,
+                    "region": TMDB_REGION, "page": 1},
+            timeout=10,
+        ).json()
+        for item in r.get("results", []):
+            out.append(_build_item(item, lang, with_release=True))
+        # sort soonest-first so the calendar tab reads naturally
+        out.sort(key=lambda m: m.get("releaseDate") or "9999-99-99")
+    except Exception:
+        log.exception("upcoming fetch failed")
+
+    _UPCOMING_CACHE[lang] = (time.time(), out)
+    return out
 
 
 # ===========================================================================
@@ -407,11 +529,22 @@ def _collect(date: Optional[dt.date]) -> dict:
             log.exception("scraper %s failed: %s", name, e)
 
     movie_list = list(movies.values())
-    # Attach posters / ratings / trailers from TMDB + OMDb.
     enrich_movies(movie_list)
     return {"movies": movie_list,
             "theaters": list(theaters.values()),
             "showtimes": showtimes}
+
+
+@app.get("/api/catalog")
+def api_catalog(lang: str = Query("en-US", description="e.g. en-US or ar-SA")):
+    """Now Playing in Saudi Arabia — posters, ratings, trailers. No showtimes."""
+    return {"movies": now_playing_sa(lang), "theaters": [], "showtimes": []}
+
+
+@app.get("/api/upcoming")
+def api_upcoming(lang: str = Query("en-US", description="e.g. en-US or ar-SA")):
+    """Coming Soon in Saudi Arabia — for the calendar tab. Each movie has a releaseDate."""
+    return {"movies": upcoming_sa(lang), "theaters": [], "showtimes": []}
 
 
 @app.get("/api/data")
@@ -441,7 +574,7 @@ def api_debug():
 @app.get("/")
 def root():
     return {"status": "ok", "version": VERSION,
-            "endpoints": ["/api/data", "/api/debug"],
+            "endpoints": ["/api/catalog", "/api/upcoming", "/api/data", "/api/debug"],
             "chains": [name for name, _ in SCRAPERS]}
 
 
