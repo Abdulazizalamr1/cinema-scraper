@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-VERSION = "v6-upcoming"
+VERSION = "v7-appshape"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("cinema-api")
@@ -98,6 +98,33 @@ def _omdb_ratings(imdb_id: str) -> dict:
     return out
 
 
+_LANG_NAMES = {
+    "en": "English", "ar": "Arabic", "hi": "Hindi", "ur": "Urdu",
+    "fr": "French", "es": "Spanish", "ml": "Malayalam", "ta": "Tamil",
+    "te": "Telugu", "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
+}
+
+
+def _lang_name(code: str) -> str:
+    if not code:
+        return "English"
+    return _LANG_NAMES.get(code.lower(), code.capitalize())
+
+
+def _format_release(iso: str):
+    """'2026-06-25' -> ('June 25, 2026', 'June 2026', 4)."""
+    if not iso:
+        return None, None, None
+    try:
+        d = dt.datetime.strptime(iso, "%Y-%m-%d").date()
+    except Exception:
+        return iso, None, None
+    release_text = f"{d.strftime('%B')} {d.day}, {d.year}"
+    month_year = d.strftime("%B %Y")
+    week_number = (d.day - 1) // 7 + 1
+    return release_text, month_year, week_number
+
+
 def _meta_for_tmdb_id(mid: int, lang: str = "en-US") -> dict:
     """Full metadata for a movie we already know the TMDB id of."""
     key = ("id", mid, lang)
@@ -107,13 +134,16 @@ def _meta_for_tmdb_id(mid: int, lang: str = "en-US") -> dict:
 
     meta = {
         "posterUrl": None, "trailerUrl": None, "durationMin": None, "genre": None,
+        "synopsis": "", "language": "English", "ratingStars": None,
+        "cast": [], "starring": "",
         "ratings": {"imdb": None, "rotten_tomatoes": None, "metacritic": None},
+        "imdbRating": None, "rottenTomatoesRating": None,
     }
     try:
         d = requests.get(
             f"{TMDB}/movie/{mid}",
             params={"api_key": TMDB_KEY, "language": lang,
-                    "append_to_response": "videos,external_ids"},
+                    "append_to_response": "videos,external_ids,credits"},
             timeout=10,
         ).json()
 
@@ -123,13 +153,27 @@ def _meta_for_tmdb_id(mid: int, lang: str = "en-US") -> dict:
             meta["durationMin"] = d["runtime"]
         if d.get("genres"):
             meta["genre"] = d["genres"][0]["name"]
+        if d.get("overview"):
+            meta["synopsis"] = d["overview"]
+        if d.get("original_language"):
+            meta["language"] = _lang_name(d["original_language"])
+        if d.get("vote_average"):
+            # TMDB is 0-10; the app shows 0-5 stars
+            meta["ratingStars"] = round(d["vote_average"] / 2.0, 1)
+
+        cast = [c["name"] for c in d.get("credits", {}).get("cast", [])[:5] if c.get("name")]
+        meta["cast"] = cast
+        meta["starring"] = ", ".join(cast[:2])
 
         for v in d.get("videos", {}).get("results", []):
             if v.get("site") == "YouTube" and v.get("type") == "Trailer":
                 meta["trailerUrl"] = f"https://www.youtube.com/watch?v={v['key']}"
                 break
 
-        meta["ratings"] = _omdb_ratings(d.get("external_ids", {}).get("imdb_id"))
+        ratings = _omdb_ratings(d.get("external_ids", {}).get("imdb_id"))
+        meta["ratings"] = ratings
+        meta["imdbRating"] = ratings["imdb"]
+        meta["rottenTomatoesRating"] = ratings["rotten_tomatoes"]
     except Exception:
         pass
 
@@ -145,7 +189,10 @@ def _meta_for_title(title: str, lang: str = "en-US") -> dict:
         return hit[1]
     meta = {
         "posterUrl": None, "trailerUrl": None, "durationMin": None, "genre": None,
+        "synopsis": "", "language": "English", "ratingStars": None,
+        "cast": [], "starring": "",
         "ratings": {"imdb": None, "rotten_tomatoes": None, "metacritic": None},
+        "imdbRating": None, "rottenTomatoesRating": None,
     }
     try:
         r = requests.get(
@@ -163,7 +210,7 @@ def _meta_for_title(title: str, lang: str = "en-US") -> dict:
 
 
 def enrich_movies(movies: list, lang: str = "en-US") -> list:
-    """Fill posterUrl / trailerUrl / ratings on scraper movies (by title)."""
+    """Fill posters / ratings / cast on scraper movies (matched by title)."""
     for m in movies:
         title = m.get("title")
         if not title:
@@ -173,11 +220,22 @@ def enrich_movies(movies: list, lang: str = "en-US") -> list:
             m["posterUrl"] = meta["posterUrl"]
         m["trailerUrl"] = meta["trailerUrl"]
         m["ratings"] = meta["ratings"]
+        # flat fields the Android app actually reads:
+        if meta["imdbRating"]:
+            m["imdbRating"] = meta["imdbRating"]
+        if meta["rottenTomatoesRating"]:
+            m["rottenTomatoesRating"] = meta["rottenTomatoesRating"]
+        if meta["ratingStars"] is not None:
+            m["ratingStars"] = meta["ratingStars"]
+        if meta["synopsis"]:
+            m["synopsis"] = meta["synopsis"]
+        if meta["cast"]:
+            m["cast"] = meta["cast"]
     return movies
 
 
-def _build_item(item: dict, lang: str, with_release: bool = False) -> dict:
-    """Turn one TMDB list entry into the app's enriched movie shape."""
+def _build_movie(item: dict, lang: str) -> dict:
+    """Now-playing entry shaped to the app's Movie data class."""
     mid = item["id"]
     meta = _meta_for_tmdb_id(mid, lang)
     poster = meta["posterUrl"]
@@ -186,19 +244,59 @@ def _build_item(item: dict, lang: str, with_release: bool = False) -> dict:
     genre = meta["genre"]
     if not genre and item.get("genre_ids"):
         genre = _GENRE_CACHE.get(item["genre_ids"][0])
+
     out = {
         "id": f"TMDB-{mid}",
         "title": item.get("title"),
-        "posterUrl": poster,
         "genre": genre,
         "durationMin": meta["durationMin"],
+        "language": meta["language"],
+        "synopsis": meta["synopsis"] or item.get("overview", ""),
+        "posterUrl": poster,
+        "cast": meta["cast"],
+        # extras the app ignores today but are handy later:
         "trailerUrl": meta["trailerUrl"],
         "ratings": meta["ratings"],
     }
-    if with_release:
-        # release_date from the list entry; fall back to detail field if needed
-        out["releaseDate"] = item.get("release_date") or None
+    # Only send rating fields when we actually have them, so the app keeps
+    # its own placeholder instead of showing a wrong value.
+    if meta["imdbRating"]:
+        out["imdbRating"] = meta["imdbRating"]
+    if meta["rottenTomatoesRating"]:
+        out["rottenTomatoesRating"] = meta["rottenTomatoesRating"]
+    if meta["ratingStars"] is not None:
+        out["ratingStars"] = meta["ratingStars"]
     return out
+
+
+def _build_upcoming(item: dict, lang: str) -> dict:
+    """Coming-soon entry shaped to the app's UpcomingMovie data class."""
+    mid = item["id"]
+    meta = _meta_for_tmdb_id(mid, lang)
+    poster = meta["posterUrl"]
+    if not poster and item.get("poster_path"):
+        poster = f"{IMG}/w500{item['poster_path']}"
+    genre = meta["genre"]
+    if not genre and item.get("genre_ids"):
+        genre = _GENRE_CACHE.get(item["genre_ids"][0])
+
+    release_text, month_year, week_number = _format_release(item.get("release_date"))
+
+    return {
+        "id": f"TMDB-{mid}",
+        "title": item.get("title"),
+        "genre": genre,
+        "releaseDate": release_text,
+        "monthName": month_year,
+        "weekNumber": week_number,
+        "expectedChains": [],          # not knowable from TMDB; app handles empty
+        "description": meta["synopsis"] or item.get("overview", ""),
+        "language": meta["language"],
+        "starring": meta["starring"],
+        "posterUrl": poster,           # real poster, for the app to use if wired
+        "trailerUrl": meta["trailerUrl"],
+        "_releaseIso": item.get("release_date"),  # for sorting only
+    }
 
 
 def now_playing_sa(lang: str = "en-US") -> list:
@@ -217,7 +315,7 @@ def now_playing_sa(lang: str = "en-US") -> list:
             timeout=10,
         ).json()
         for item in r.get("results", []):
-            out.append(_build_item(item, lang))
+            out.append(_build_movie(item, lang))
     except Exception:
         log.exception("now_playing fetch failed")
 
@@ -226,7 +324,7 @@ def now_playing_sa(lang: str = "en-US") -> list:
 
 
 def upcoming_sa(lang: str = "en-US") -> list:
-    """Films coming soon in Saudi Arabia, enriched + with releaseDate."""
+    """Films coming soon in Saudi Arabia, shaped for the calendar tab."""
     hit = _UPCOMING_CACHE.get(lang)
     if hit and time.time() - hit[0] < _UPCOMING_TTL:
         return hit[1]
@@ -241,9 +339,11 @@ def upcoming_sa(lang: str = "en-US") -> list:
             timeout=10,
         ).json()
         for item in r.get("results", []):
-            out.append(_build_item(item, lang, with_release=True))
-        # sort soonest-first so the calendar tab reads naturally
-        out.sort(key=lambda m: m.get("releaseDate") or "9999-99-99")
+            out.append(_build_upcoming(item, lang))
+        # soonest-first, then drop the internal sort key
+        out.sort(key=lambda m: m.get("_releaseIso") or "9999-99-99")
+        for m in out:
+            m.pop("_releaseIso", None)
     except Exception:
         log.exception("upcoming fetch failed")
 
